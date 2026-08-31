@@ -1,0 +1,6 @@
+{
+  "name": "Sidra Inspector",
+  "description": "Live token inspector and risk scanner for SidraChain.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
