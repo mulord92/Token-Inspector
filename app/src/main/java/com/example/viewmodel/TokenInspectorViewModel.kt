@@ -1,28 +1,24 @@
 package com.example.viewmodel
 
+import android.app.Application
 import androidx.compose.ui.graphics.Color
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.data.SmartContractResponse
-import com.example.data.TokenResponse
-import com.example.network.BlockscoutApi
-import com.squareup.moshi.Moshi
-import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
-import kotlinx.coroutines.async
+import com.example.data.TokenInspectResult
+import com.example.data.local.AppDatabase
+import com.example.data.local.InspectedTokenEntity
+import com.example.data.local.TokenHistoryRepository
+import com.example.network.RateLimitException
+import com.example.network.ScanProgress
+import com.example.network.SidraRepository
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import retrofit2.Retrofit
-import retrofit2.converter.moshi.MoshiConverterFactory
 import kotlin.math.pow
-
-data class TokenData(
-    val token: TokenResponse,
-    val smart: SmartContractResponse?,
-    val txCount: Long?
-)
 
 data class RiskFlag(
     val level: String, // "critical", "high", "medium", "low"
@@ -39,22 +35,29 @@ data class RiskAnalysis(
 
 sealed class AppState {
     object Idle : AppState()
-    data class Scanning(val step: String) : AppState()
-    data class Error(val message: String) : AppState()
-    data class Done(val data: TokenData, val analysis: RiskAnalysis) : AppState()
+    data class Scanning(val progress: ScanProgress) : AppState()
+    data class Error(val message: String, val isRateLimit: Boolean = false) : AppState()
+    data class Done(val data: TokenInspectResult, val analysis: RiskAnalysis) : AppState()
 }
 
-class TokenInspectorViewModel : ViewModel() {
-    private val moshi = Moshi.Builder()
-        .add(KotlinJsonAdapterFactory())
-        .build()
+class TokenInspectorViewModel @JvmOverloads constructor(
+    application: Application = Application(),
+    historyRepository: TokenHistoryRepository? = null,
+    private val repository: SidraRepository = SidraRepository()
+) : AndroidViewModel(application) {
 
-    private val retrofit = Retrofit.Builder()
-        .baseUrl("https://ledger.sidrachain.com/api/v2/")
-        .addConverterFactory(MoshiConverterFactory.create(moshi))
-        .build()
+    private val historyRepo: TokenHistoryRepository? = historyRepository ?: try {
+        TokenHistoryRepository(AppDatabase.getDatabase(application).tokenInspectionDao())
+    } catch (e: Exception) {
+        null
+    }
 
-    private val api = retrofit.create(BlockscoutApi::class.java)
+    val recentInspections: StateFlow<List<InspectedTokenEntity>> = (historyRepo?.recentInspections ?: MutableStateFlow(emptyList()))
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
 
     private val _uiState = MutableStateFlow<AppState>(AppState.Idle)
     val uiState: StateFlow<AppState> = _uiState.asStateFlow()
@@ -64,48 +67,78 @@ class TokenInspectorViewModel : ViewModel() {
     }
 
     fun scan(address: String) {
-        val trimmed = address.trim()
-        if (trimmed.length < 10) return
+        val normalized = com.example.network.normalizeContractAddress(address)
+        if (normalized.length < 10) return
 
-        _uiState.value = AppState.Scanning("Fetching token data from ledger.sidrachain.com…")
+        _uiState.value = AppState.Scanning(ScanProgress(step = "Connecting to ledger.sidrachain.com…"))
 
         viewModelScope.launch {
             try {
-                // Fetch token
-                val tokenDef = async { api.getToken(trimmed) }
-                // Fetch transfers for tx count (we can ignore errors if it fails)
-                val transfersDef = async { 
-                    try { api.getTransfers(trimmed) } catch (e: Exception) { null } 
+                val result = repository.fetchTokenData(normalized) { progress ->
+                    _uiState.value = AppState.Scanning(progress)
                 }
-                // Fetch smart contract
-                val smartDef = async {
-                    try { api.getSmartContract(trimmed) } catch (e: Exception) { null }
+                result.onSuccess { data ->
+                    _uiState.value = AppState.Scanning(ScanProgress(step = "Analyzing contract risk…"))
+                    delay(250)
+                    val analysis = analyzeRisk(data)
+                    _uiState.value = AppState.Done(data, analysis)
+
+                    // Persist to Room local storage
+                    launch {
+                        try {
+                            historyRepo?.saveInspection(normalized, data, analysis)
+                        } catch (e: Exception) {
+                            // Non-blocking database failure safety
+                        }
+                    }
+                }.onFailure { error ->
+                    val isRateLimit = error is RateLimitException
+                    _uiState.value = AppState.Error(
+                        message = error.message ?: "Could not reach ledger.sidrachain.com — check the address.",
+                        isRateLimit = isRateLimit
+                    )
                 }
-                
-                val token = tokenDef.await()
-                val transfers = transfersDef.await()
-                
-                _uiState.value = AppState.Scanning("Analyzing contract risk…")
-                val smart = smartDef.await()
-
-                val data = TokenData(
-                    token = token,
-                    smart = smart,
-                    txCount = transfers?.nextPageParams?.index
-                )
-
-                val analysis = analyzeRisk(data)
-
-                delay(500) // slight delay for animation effect
-                _uiState.value = AppState.Done(data, analysis)
-
             } catch (e: Exception) {
-                _uiState.value = AppState.Error(e.message ?: "Could not reach ledger.sidrachain.com — check the address.")
+                _uiState.value = AppState.Error(
+                    message = e.message ?: "An unexpected error occurred.",
+                    isRateLimit = e is RateLimitException
+                )
             }
         }
     }
 
-    private fun analyzeRisk(data: TokenData): RiskAnalysis {
+    fun loadSampleToken(sampleAddress: String? = null) {
+        val normalized = sampleAddress?.let { com.example.network.normalizeContractAddress(it) } ?: "0x2cE9e7c168035D61cc3a3655949C147c063EeCc4"
+        _uiState.value = AppState.Scanning(ScanProgress(step = "Loading contract analysis specimen…"))
+        viewModelScope.launch {
+            delay(300)
+            val sampleData = repository.getSampleToken(normalized)
+            val analysis = analyzeRisk(sampleData)
+            _uiState.value = AppState.Done(sampleData, analysis)
+        }
+    }
+
+    fun deleteFromHistory(address: String) {
+        viewModelScope.launch {
+            try {
+                historyRepo?.deleteInspection(address)
+            } catch (e: Exception) {
+                // Non-blocking database failure safety
+            }
+        }
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch {
+            try {
+                historyRepo?.clearHistory()
+            } catch (e: Exception) {
+                // Non-blocking database failure safety
+            }
+        }
+    }
+
+    fun analyzeRisk(data: TokenInspectResult): RiskAnalysis {
         val flags = mutableListOf<RiskFlag>()
         var score = 0
 
@@ -127,29 +160,35 @@ class TokenInspectorViewModel : ViewModel() {
         }
 
         // 3. Self-destruct capability
-        val abiStr = smart?.abi?.toString()?.lowercase() ?: ""
-        val hasSelfDestruct = listOf("selfdestruct", "destroy", "kill").any { abiStr.contains(it) }
+        val abiList = smart?.abiFunctions ?: emptyList()
+        val hasSelfDestruct = abiList.any { fn ->
+            listOf("selfdestruct", "destroy", "kill").any { k -> fn.contains(k, ignoreCase = true) }
+        }
         if (hasSelfDestruct) {
             flags.add(RiskFlag("critical", "Self-Destruct Function Detected", "Owner can permanently destroy the contract, wiping all token balances."))
             score += 40
         }
 
         // 4. Mint function
-        val hasMint = listOf("mint", "issue", "create", "generatetokens").any { abiStr.contains(it) }
+        val hasMint = abiList.any { fn ->
+            listOf("mint", "issue", "create", "generatetokens").any { k -> fn.contains(k, ignoreCase = true) }
+        }
         if (hasMint) {
             flags.add(RiskFlag("critical", "Mint Function Present", "Owner can create new tokens at any time, diluting your holdings."))
             score += 30
         }
 
         // 5. Pause / freeze function
-        val hasPause = listOf("pause", "freeze", "blacklist", "ban", "lock").any { abiStr.contains(it) }
+        val hasPause = abiList.any { fn ->
+            listOf("pause", "freeze", "blacklist", "ban", "lock").any { k -> fn.contains(k, ignoreCase = true) }
+        }
         if (hasPause) {
             flags.add(RiskFlag("high", "Transfer Control Function", "Owner can pause transfers or blacklist wallets — your tokens could be frozen."))
             score += 15
         }
 
         // 6. Very low holder count = concentrated risk
-        val holderCount = token.holders?.toIntOrNull() ?: 0
+        val holderCount = token.holders?.toDoubleOrNull()?.toInt() ?: 0
         if (holderCount in 1..49) {
             flags.add(RiskFlag("medium", "Low Holder Count ($holderCount)", "Very few wallets hold this token. High concentration increases manipulation risk."))
             score += 10
@@ -158,7 +197,11 @@ class TokenInspectorViewModel : ViewModel() {
         // 7. Total supply sanity
         val supply = token.totalSupply?.toDoubleOrNull() ?: 0.0
         val decimals = token.decimals?.toIntOrNull() ?: 18
-        val realSupply = supply / 10.0.pow(decimals)
+        val realSupply = try {
+            if (decimals in 0..30) supply / 10.0.pow(decimals) else supply
+        } catch (e: Exception) {
+            supply
+        }
         if (realSupply > 1e15) {
             flags.add(RiskFlag("medium", "Astronomical Token Supply", "Token supply exceeds 1 quadrillion — often a sign of low-quality or spam token."))
             score += 8
@@ -170,8 +213,8 @@ class TokenInspectorViewModel : ViewModel() {
             score += 5
         }
 
-        val cappedScore = score.coerceAtMost(100)
-        
+        val cappedScore = score.coerceIn(0, 100)
+
         val verdict: String
         val verdictColor: Color
         if (cappedScore >= 55) {
@@ -182,7 +225,7 @@ class TokenInspectorViewModel : ViewModel() {
             verdictColor = Color(0xFFF59E0B)
         } else {
             verdict = "LOW RISK"
-            verdictColor = Color(0xFF22C55E)
+            verdictColor = Color(0xFF34D399)
         }
 
         return RiskAnalysis(cappedScore, verdict, verdictColor, flags)

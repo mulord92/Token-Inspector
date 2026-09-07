@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "Sidra Inspector"
+rootProject.name = "Sidrachain Sentinel Token Inspector"
 
 include(":app")
