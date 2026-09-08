@@ -3,6 +3,7 @@ package com.example
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Refresh
 import kotlinx.coroutines.delay
@@ -359,6 +360,27 @@ fun InputSection(
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("COPIED", fontSize = 10.sp, color = Color(0xFF22C55E), fontWeight = FontWeight.Bold)
                             }
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    clipboardManager.getText()?.text?.let { pastedText ->
+                                        onAddressChange(pastedText)
+                                    }
+                                }
+                                .padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.ContentPaste,
+                                contentDescription = "Paste",
+                                tint = Color(0xFF64748B),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("PASTE", fontSize = 10.sp, color = Color(0xFF64748B), fontWeight = FontWeight.Bold)
                         }
                     }
                 }
